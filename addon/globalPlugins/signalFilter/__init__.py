@@ -415,17 +415,13 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			s = _strip(text)
 			if not s:
 				return 0
-			self._debug("recv %r (polite=%s)" % (s, politeness))
 			if _NOISE_RE.match(s):
-				self._debug("ignore noise %r" % s)
 				return 0
 			if len(s) <= _TYPING_TEXT_MAXLEN and _TYPING_TEXT_RE.match(s):
-				self._debug("typing detected %r" % s)
 				queueHandler.queueFunction(queueHandler.eventQueue, self._onTyping)
 				return 0
 			# Something changed that might be a message -> read it on the main
 			# thread.  Collapse a burst into a single queued scan.
-			self._debug("candidate %r -> queue scan" % s)
 			if not self._scanQueued:
 				self._scanQueued = True
 				queueHandler.queueFunction(queueHandler.eventQueue, self._onMessageEvent)
@@ -464,7 +460,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				lst.append(x)
 
 		found = None
-		focusObj = None
 		convRoots = []  # small: the enclosing conversation container(s)
 		docRoots = []  # large: whole-document roots (last resort)
 		for getter in (api.getFocusObject, api.getNavigatorObject):
@@ -474,8 +469,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				o = None
 			if o is None:
 				continue
-			if focusObj is None:
-				focusObj = o
 			# (a) Cheapest: focus is already inside the list -> walk straight up.
 			up = _ancestorMatching(o, _isMessageList, maxUp=25)
 			if up is not None:
@@ -488,14 +481,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			# (c) The browse-mode document root, for the rare last-resort search.
 			ti = getattr(o, "treeInterceptor", None)
 			_add(docRoots, getattr(ti, "rootNVDAObject", None) if ti is not None else None)
-		if focusObj is not None:
-			self._debug("acquire: focus role=%s class=%r" % (_role(focusObj), _cls(focusObj)[:80]))
 		if found is None:
 			for cc in convRoots:
 				found = _findDescendant(cc, _isMessageList, maxDepth=20, maxNodes=2500)
 				if found is not None:
 					break
-		docSearched = False
 		if found is None and docRoots:
 			# Last resort: search the whole document.  This is expensive and, when
 			# no conversation is open, fruitless -- so run it at most once every
@@ -503,17 +493,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			now = time.time()
 			if (now - self._lastDocSearch) >= LIST_DOC_SEARCH_RETRY:
 				self._lastDocSearch = now
-				docSearched = True
 				for root in docRoots:
 					found = _findDescendant(
 						root, _isMessageList, maxDepth=30, maxNodes=LIST_DOC_SEARCH_MAXNODES
 					)
 					if found is not None:
 						break
-		self._debug(
-			"acquire: convRoots=%d docRoots=%d docSearched=%s found=%s"
-			% (len(convRoots), len(docRoots), docSearched, found is not None)
-		)
 		if found is not None:
 			self._mlist = found
 			self._region = _ancestorMatching(found, _isTimelineRegion, maxUp=10)
@@ -528,7 +513,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		if not self._cfg("enabled"):
 			return
 		mlist = self._messageList()
-		self._debug("scan: mlist=%s" % ("found" if mlist is not None else "NONE"))
 		if mlist is None:
 			return
 		try:
@@ -551,7 +535,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				continue
 			container = _messageContainer(child)
 			if container is None:
-				self._debug("scan: child %d has no message container" % i)
 				continue
 			uuid = _id(container)
 			if uuid in self._seen:
@@ -560,8 +543,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			if info:
 				newMsgs.append(info)
 		newMsgs.reverse()
-
-		self._debug("scan: n=%d conv=%r priming=%s new=%d" % (n, conv, priming, len(newMsgs)))
 
 		if not newMsgs:
 			return
@@ -754,15 +735,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			return
 		mlist = self._mlist or self._messageList()
 		present = bool(mlist is not None and self._typingPresent(mlist))
-		self._debug("poll typing: present=%s misses=%d" % (present, self._typingMisses))
-		if not present and mlist is not None:
-			# Pinpoint where the typing bubble is if we failed to find it.
-			try:
-				nn = _childCount(mlist)
-				tail = [(_cls(_getChild(mlist, j)) or "")[:48] for j in range(max(0, nn - 3), nn)]
-				self._debug("poll typing: list-tail classes=%r" % tail)
-			except Exception:
-				pass
 		if present:
 			self._typingMisses = 0
 			self._startTypingPoll()
