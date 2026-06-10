@@ -88,9 +88,11 @@ CLS_MSG_TEXT = "module-message__text"
 CLS_AUTHOR = "module-message__author"
 CLS_TYPING = "module-typing-animation"
 CLS_TYPING_BUBBLE = "module-message--typing-bubble"
+CLS_MSG_GROUP = "module-message--group"  # on the typing bubble only in group chats
 CLS_TYPING_AVATAR = "module-message__typing-avatar"  # one per typist (group), name = contact
+CLS_TYPING_AVATAR_SPACER = "module-message__typing-avatar-spacer"  # contains the above as a substring!
+CLS_TYPING_AVATAR_CONTAINER = "module-message__author-avatar-container--typing"
 CLS_TYPING_AVATAR_OVERFLOW = "--overflow-count"  # the "+N more typists" avatar
-CLS_AVATAR = "module-Avatar"
 CLS_HEADER_TITLE = "module-ConversationHeader__header__info__title"
 CLS_HEADER_BTN = "module-ConversationHeader__header--clickable"
 CLS_TIMELINE_REGION = "ConversationView__timeline"
@@ -264,6 +266,32 @@ def _isMessageList(o):
 def _typingNode(o):
 	c = _cls(o)
 	return CLS_TYPING in c or CLS_TYPING_BUBBLE in c
+
+
+def _namedDescendants(root, maxDepth=6, maxNodes=80, limit=6):
+	"""Collect the accessible names of the first few NAMED nodes under root, in
+	document order, without descending into a named node (its children usually
+	just echo its label).  Bounded -- used only when typing starts.  This reads
+	whatever node actually carries the name, which matters because Chromium
+	prunes unlabeled plain divs from the tree, so the labelled node may sit at
+	an unpredictable depth."""
+	out = []
+	stack = [(root, 0)]
+	budget = maxNodes
+	while stack and budget > 0 and len(out) < limit:
+		o, d = stack.pop()
+		budget -= 1
+		nm = _strip(_name(o))
+		if nm:
+			out.append(nm)
+			continue
+		if d < maxDepth:
+			cnt = _childCount(o)
+			for i in range(min(cnt, 8) - 1, -1, -1):
+				ch = _getChild(o, i)
+				if ch is not None:
+					stack.append((ch, d + 1))
+	return out
 
 
 def _convContainer(node):
@@ -585,15 +613,19 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	def _typingNames(self):
 		"""For a group chat, read the names of who is typing from the typing
 		bubble's avatars (class module-message__typing-avatar, accessible name =
-		the contact).  Returns (names, overflow); a 1:1 bubble has no such avatars
-		so returns ([], False).  Runs once when typing starts, not on the poll."""
+		the contact).  Returns (names, overflow, isGroup); a 1:1 bubble has no
+		avatars and no --group class, so it returns ([], False, False).  Runs once
+		when typing starts, not on the poll."""
 		mlist = self._mlist or self._messageList()
 		if mlist is None:
-			return [], False
+			return [], False, False
 
 		avatars = []
+		containers = []
+		isGroup = False
 
 		def gather(root):
+			nonlocal isGroup
 			stack = [(root, 0)]
 			budget = 120
 			while stack and budget > 0:
@@ -602,12 +634,24 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				c = _cls(o)
 				if CLS_MESSAGE_LIST in c:
 					continue  # never crawl the message list
+				if CLS_TYPING_BUBBLE in c and CLS_MSG_GROUP in c:
+					# Signal puts --group on the typing bubble only in group chats.
+					isGroup = True
+				if CLS_TYPING_AVATAR_SPACER in c:
+					# The spacer's class CONTAINS the avatar class as a substring;
+					# skip it before the avatar check or it becomes a phantom avatar.
+					continue
 				if CLS_TYPING_AVATAR in c:
 					avatars.append(o)
 					continue
+				if CLS_TYPING_AVATAR_CONTAINER in c:
+					containers.append(o)
+					# fall through: the real avatars are its children
 				if d < 8:
 					cnt = _childCount(o)
-					for i in range(min(cnt, 8)):
+					# Push in reverse so the LIFO pops children in document order
+					# (otherwise the spoken names come out reversed).
+					for i in range(min(cnt, 8) - 1, -1, -1):
 						ch = _getChild(o, i)
 						if ch is not None:
 							stack.append((ch, d + 1))
@@ -636,26 +680,50 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				continue
 			nm = _strip(_name(av))
 			if not nm:
-				inner = _findDescendant(av, lambda o: CLS_AVATAR in _cls(o), maxDepth=4, maxNodes=30)
-				if inner is not None:
-					nm = _strip(_name(inner))
+				# The avatar div itself is usually unlabeled; the name sits on a
+				# labelled node (e.g. the clickable avatar) somewhere below it.
+				inner = _namedDescendants(av, maxDepth=5, maxNodes=40, limit=1)
+				nm = inner[0] if inner else ""
 			if nm and nm not in names:
 				names.append(nm)
-		self._debug("typing avatars: %d, names=%r overflow=%s" % (len(avatars), names, overflow))
-		return names, overflow
 
-	def _typingSubject_(self, names, overflow):
+		if not names and containers:
+			# Chromium may prune the unlabeled per-typist avatar divs entirely (it
+			# does this to Signal's status icon), leaving only the labelled nodes.
+			# Read named descendants of the avatar container directly; a bare
+			# "+N" name is the overflow indicator, not a contact.
+			for cont in containers:
+				for nm in _namedDescendants(cont, maxDepth=6, maxNodes=80, limit=6):
+					if re.fullmatch(r"\+\s*\d{1,3}", nm):
+						overflow = True
+						continue
+					if nm not in names:
+						names.append(nm)
+
+		# Avatars/containers only render in group chats, so they also prove
+		# group-ness even if the --group class was missed.
+		isGroup = isGroup or bool(avatars) or bool(containers)
+		self._debug(
+			"typing avatars: %d containers: %d names=%r overflow=%s group=%s"
+			% (len(avatars), len(containers), names, overflow, isGroup)
+		)
+		return names, overflow, isGroup
+
+	def _buildTypingSubject(self, names, overflow):
 		"""Build the spoken subject + a plural flag from the typist names."""
+		if not names:
+			# Translators: spoken when the typist's name is unknown.
+			return _("Someone"), False
 		if overflow or len(names) > 3:
 			# Translators: typing subject when several people type; {first} is a name.
 			return _("{first} and others").format(first=names[0]), True
 		if len(names) == 1:
 			return names[0], False
 		if len(names) == 2:
-			# Translators: two people typing; {first} and {second} are names.
+			# Translators: subject naming two people; {first} and {second} are names.
 			return _("{first} and {second}").format(first=names[0], second=names[1]), True
 		# exactly three
-		# Translators: three people typing; the three are names.
+		# Translators: subject naming three people; first/second/third are names.
 		return (
 			_("{first}, {second} and {third}").format(
 				first=names[0], second=names[1], third=names[2]
@@ -664,28 +732,38 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		)
 
 	def _onTyping(self):
-		if not self._cfg("enabled") or not self._cfg("announceTyping"):
+		if not self._cfg("enabled"):
+			return
+		announceStart = self._cfg("announceTyping")
+		# Latch the typing state even when the start announcement is off, so the
+		# independent "stopped typing" option still works on its own.
+		if not (announceStart or self._cfg("announceTypingStopped")):
 			return
 		if not self._typingActive:
 			self._typingActive = True
 			if self._mlist is None:
 				self._messageList()
-			# In a group the typing bubble names the typists; in a 1:1 it doesn't,
-			# so fall back to the conversation's (contact) name.
-			names, overflow = self._typingNames()
+			# In a group the typing bubble names the typists.  In a 1:1 there are
+			# no typist avatars, so use the conversation's contact name.  In a
+			# group where the names can't be read, say "Someone" -- announcing the
+			# GROUP'S name as if the group itself were typing sounds wrong.
+			names, overflow, isGroup = self._typingNames()
 			if names:
-				subject, plural = self._typingSubject_(names, overflow)
+				subject, plural = self._buildTypingSubject(names, overflow)
+			elif isGroup:
+				subject, plural = _("Someone"), False
 			else:
 				subject, plural = (self._contact() or _("Someone")), False
 			self._typingSubject = subject
-			if plural:
-				# Translators: announced when several people are typing; {who} is
-				# a list of names.
-				ui.message(_("{who} are typing.").format(who=subject))
-			else:
-				# Translators: announced when the other person starts typing;
-				# {who} is the contact name.
-				ui.message(_("{who} is typing.").format(who=subject))
+			if announceStart:
+				if plural:
+					# Translators: announced when several people are typing; {who}
+					# is a list of names.
+					ui.message(_("{who} are typing.").format(who=subject))
+				else:
+					# Translators: announced when the other person starts typing;
+					# {who} is the contact name.
+					ui.message(_("{who} is typing.").format(who=subject))
 		# A fresh typing event means they're still at it -- reset the miss count.
 		self._typingMisses = 0
 		# Removals don't fire live-region events, so poll the DOM for the typing
@@ -769,6 +847,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			# Translators: announced when the other person stops typing without
 			# sending a message; {who} is the contact name (or list of names).
 			ui.message(_("{who} stopped typing.").format(who=who))
+		self._typingSubject = None
 
 	def _contact(self):
 		conv = self._conv
