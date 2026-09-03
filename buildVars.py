@@ -31,10 +31,15 @@ indicator through untouched. No other application is affected. It works by
 filtering NVDA's web live-region callback, so there is no lag."""
 	),
 	# version
-	addon_version="1.0.0",
+	addon_version="1.0.1",
 	# Brief changelog for this version
 	# Translators: what's new content for the add-on version to be shown in the add-on store
-	addon_changelog=_("""First release. Ported from the Orca Signal Filter add-on for Linux."""),
+	addon_changelog=_(
+		"""Works on more setups: the live-region hook now falls back to the
+undecorated symbol name, Signal Beta and Signal Desktop are recognised, and live
+regions delivered through UI Automation are handled too. Adds a diagnostics
+command (NVDA+control+shift+S) that says why the add-on is silent."""
+	),
 	# Author(s)
 	addon_author="Tobias <require_flatfoot171@simplelogin.com>",
 	# URL for the add-on documentation support
@@ -60,6 +65,7 @@ filtering NVDA's web live-region callback, so there is no lag."""
 # Define the python files that are the sources of your add-on.
 pythonSources: list[str] = [
 	"addon/globalPlugins/signalFilter/*.py",
+	"addon/appModules/*.py",
 ]
 
 # Files that contain strings for translation. Usually your python sources

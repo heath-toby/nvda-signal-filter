@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.0.1
+
+- **Fixed: the add-on did nothing at all on NVDA 2025.3 and earlier.** NVDA
+  2026.1 moved the helper library: `NVDAHelper.localLib` used to be the DLL
+  itself and is now a module whose `dll` attribute holds it. 1.0.0 only knew the
+  new layout, so on any older NVDA the live-region hook failed to install and
+  the add-on stayed completely silent while looking installed and enabled (the
+  failure was only visible as one line in the NVDA log). Both layouts are now
+  detected, so the add-on works on NVDA 2024.1 through 2026.x.
+- Other setups where 1.0.0 could be silent:
+  - the live-region callback is now hooked under either the decorated or the
+    undecorated symbol name, instead of failing silently on an NVDA build that
+    exports only one of them;
+  - Signal Beta, Signal Desktop, Signal Dev, Signal Nightly and Signal Staging
+    are recognised as Signal, not just an executable named exactly "Signal";
+  - live regions delivered through UI Automation (when NVDA is set to use UIA
+    for Chromium) are now handled by a Signal app module, and Signal's markers
+    are read from the UIA class name / automation id in that case. Previously
+    that path bypassed the add-on entirely and it announced nothing.
+- New diagnostics command, **NVDA+control+shift+S**: speaks why the add-on is or
+  is not announcing and copies a full report to the clipboard. Also available as
+  a button in the add-on's settings. It reports the hook state (including
+  whether something else has replaced the callback), how many live-region events
+  have arrived and by which path, the recent live-region texts, whether NVDA is
+  exposing Signal over IAccessible2 or UIA, whether Signal's markers can be read,
+  and the relevant NVDA settings.
+
 ## 1.0.0
 
 - First release. Reproduces the Orca Signal Filter add-on's clean announcements

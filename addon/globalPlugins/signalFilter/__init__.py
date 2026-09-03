@@ -21,7 +21,10 @@ How it is driven (and why it is not slow)
 -----------------------------------------
 For web content NVDA announces ARIA live regions via its in-process helper, which
 calls ``NVDAHelper.nvdaControllerInternal_reportLiveRegion(text, politeness)``.
-We overwrite that callback's DLL function pointer (exactly as NVDA installs it).
+We overwrite that callback's DLL function pointer (exactly as NVDA installs it),
+in whichever way this NVDA version exposes the helper library -- see
+``_localHelperDlls``; guessing wrong there is silent, and silence is exactly what
+this add-on must never fail into.
 While Signal is the foreground app our callback:
 
   * returns 0 for everything, so NVDA never speaks Signal's noisy live regions
@@ -33,6 +36,12 @@ While Signal is the foreground app our callback:
     the newest message(s) onto NVDA's MAIN thread, which produces the clean
     announcement.
 
+If a setup never delivers live regions through that callback at all -- NVDA can
+be configured to read Chromium through UI Automation instead of IAccessible2 --
+the Signal app module (``appModules/signal.py``) feeds the same pipeline from
+``event_liveRegionChange`` instead.  NVDA+control+shift+S reports which of these
+is happening (see ``diagnostics.py``).
+
 The expensive accessibility work (reading the DOM) therefore happens on the main
 thread (where COM access is safe), only for non-noise events, bounded to the tail
 of the message list, and using cached objects -- so there is none of the
@@ -42,9 +51,10 @@ other application the original handler is called unchanged.
 
 import re
 import time
-from collections import OrderedDict
-from ctypes import WINFUNCTYPE, c_long, c_wchar_p
+from collections import OrderedDict, deque
+from ctypes import POINTER, WINFUNCTYPE, c_long, c_void_p, c_wchar_p, cast
 
+import addonHandler
 import api
 import config
 import controlTypes
@@ -55,8 +65,19 @@ import queueHandler
 import ui
 from gui.settingsDialogs import NVDASettingsDialog
 from logHandler import log
+from scriptHandler import script
 
+from . import diagnostics
 from .settingsPanel import SignalFilterSettingsPanel
+
+# The running plugin, so the Signal app module (the UI Automation fallback) and
+# the settings panel can reach it.
+_activePlugin = None
+
+
+def getActivePlugin():
+	return _activePlugin
+
 
 CONFIG_SECTION = "signalFilter"
 
@@ -80,7 +101,20 @@ _CONFIG_DEFAULTS = {
 }
 
 # --- NVDA live-region callback we hook ------------------------------------
-_FUNC_POINTER_NAME = "_nvdaControllerInternal_reportLiveRegion"
+# NVDA installs its own handler under the __stdcall-decorated name; try the
+# undecorated one too, so a differently built NVDA (or a future one) still works
+# instead of silently doing nothing.
+_FUNC_POINTER_NAMES = (
+	"_nvdaControllerInternal_reportLiveRegion",
+	"nvdaControllerInternal_reportLiveRegion",
+)
+
+# Signal ships as "Signal", but also as "Signal Beta" / "Signal Desktop"; NVDA's
+# appName is the executable's name, so match those rather than only "signal".
+_SIGNAL_APP_RE = re.compile(r"^signal(?:[ _-]?(?:beta|desktop|dev|nightly|staging))?$", re.IGNORECASE)
+
+# How many recent live-region texts to keep for the diagnostic report.
+RECENT_TEXTS = 8
 
 # --- Signal DOM markers (verified against the installed Electron build) ----
 CLS_MESSAGE_LIST = "module-timeline__messages"
@@ -145,12 +179,34 @@ def _ia2(obj):
 		return {}
 
 
+def _uiaMarkers(obj):
+	"""(class, id) for content NVDA is reading through UI Automation.
+
+	When NVDA uses UIA for Chromium rather than IAccessible2 there are no IA2
+	attributes at all; Chromium then exposes the element's HTML class as the UIA
+	ClassName and its HTML id as the AutomationId.  Reading those keeps the
+	add-on working on machines configured that way."""
+	element = getattr(obj, "UIAElement", None)
+	if element is None:
+		return "", ""
+	try:
+		return element.CurrentClassName or "", element.CurrentAutomationId or ""
+	except Exception:
+		return "", ""
+
+
 def _cls(obj):
-	return _ia2(obj).get("class", "")
+	attrs = _ia2(obj)
+	if attrs:
+		return attrs.get("class", "")
+	return _uiaMarkers(obj)[0]
 
 
 def _id(obj):
-	return _ia2(obj).get("id", "")
+	attrs = _ia2(obj)
+	if attrs:
+		return attrs.get("id", "")
+	return _uiaMarkers(obj)[1]
 
 
 def _strip(s):
@@ -369,13 +425,56 @@ def _getContact(convContainer):
 	return None
 
 
+def _localHelperDlls():
+	"""The nvdaHelperLocal DLL, however this NVDA version exposes it.
+
+	Up to NVDA 2025.3 ``NVDAHelper.localLib`` IS the ctypes CDLL; from NVDA 2026.1
+	it is a module whose ``dll`` attribute holds the CDLL.  Getting this wrong
+	fails silently -- the hook never installs, and the add-on then says nothing at
+	all while looking perfectly healthy -- so try both, newest layout first.
+	(A ctypes CDLL resolves unknown attributes as exported functions and raises
+	AttributeError for "dll", so the newer layout is detected, not guessed.)"""
+	lib = getattr(NVDAHelper, "localLib", None)
+	dlls = []
+	inner = getattr(lib, "dll", None)
+	if inner is not None:
+		dlls.append(("localLib.dll", inner))
+	if lib is not None:
+		dlls.append(("localLib", lib))
+	return dlls
+
+
+def _addonVersion():
+	try:
+		return addonHandler.getCodeAddon().manifest["version"]
+	except Exception:
+		return "<unknown>"
+
+
+def _isSignalApp(app):
+	if app is None:
+		return False
+	try:
+		name = (app.appName or "").strip()
+	except Exception:
+		return False
+	return bool(_SIGNAL_APP_RE.match(name))
+
+
 def _isSignalForeground():
 	try:
 		fg = api.getForegroundObject()
-		app = fg.appModule if fg is not None else None
-		return app is not None and (app.appName or "").lower() == "signal"
+		return _isSignalApp(fg.appModule if fg is not None else None)
 	except Exception:
 		return False
+
+
+class _MarkerProbe:
+	"""Adapter handed to the diagnostics module (keeps it free of import cycles)."""
+
+	@staticmethod
+	def isMessageList(obj):
+		return _isMessageList(obj)
 
 
 # ---------------------------------------------------------------------------
@@ -403,23 +502,68 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		self._lastDocSearch = 0.0
 		self._scanQueued = False
 
-		self._patched = False
-		self._original = NVDAHelper.nvdaControllerInternal_reportLiveRegion
-		self._hook = WINFUNCTYPE(c_long, c_wchar_p, c_wchar_p)(self._reportLiveRegion)
-		try:
-			NVDAHelper._setDllFuncPointer(NVDAHelper.localLib.dll, _FUNC_POINTER_NAME, self._hook)
-			self._patched = True
-			log.info("Signal Filter: live-region reporter hooked")
-		except Exception:
-			log.error("Signal Filter: could not hook the live-region reporter", exc_info=True)
+		# Diagnostic state -- read by diagnostics.buildReport.
+		self.hookInstalled = False
+		self.hookSymbol = None
+		self.hookError = None
+		self.helperEvents = 0  # callbacks from NVDA's in-process helper (IA2)
+		self.objectEvents = 0  # liveRegionChange events from the app module (UIA)
+		self.lastEventTime = 0.0
+		self._lastHelperEvent = 0.0
+		self.recentTexts = deque(maxlen=RECENT_TEXTS)
+		self.announceCount = 0
+		self.lastAnnounce = None
+		self.listPath = None
+		self.addonVersion = _addonVersion()
+
+		self._hookDll = None
+		self.hookLayout = None
+		self._original = getattr(NVDAHelper, "nvdaControllerInternal_reportLiveRegion", None)
+		self._hook = None
+		dlls = _localHelperDlls()
+		if self._original is None or not dlls:
+			self.hookError = "this NVDA build does not expose the live-region reporter"
+			log.error("Signal Filter: %s" % self.hookError)
+		else:
+			self._hook = WINFUNCTYPE(c_long, c_wchar_p, c_wchar_p)(self._reportLiveRegion)
+			for layout, dll in dlls:
+				for symbol in _FUNC_POINTER_NAMES:
+					try:
+						NVDAHelper._setDllFuncPointer(dll, symbol, self._hook)
+					except Exception as e:
+						self.hookError = "%s.%s: %s" % (layout, symbol, e)
+						continue
+					self.hookInstalled = True
+					self.hookLayout = layout
+					self.hookSymbol = symbol
+					self._hookDll = dll
+					self.hookError = None
+					break
+				if self.hookInstalled:
+					break
+			if self.hookInstalled:
+				log.info(
+					"Signal Filter %s: live-region reporter hooked (%s.%s)"
+					% (self.addonVersion, self.hookLayout, self.hookSymbol)
+				)
+			else:
+				log.error(
+					"Signal Filter: could not hook the live-region reporter (%s)" % self.hookError
+				)
+
+		global _activePlugin
+		_activePlugin = self
 
 	def terminate(self, *args, **kwargs):
-		if self._patched:
+		global _activePlugin
+		if _activePlugin is self:
+			_activePlugin = None
+		if self.hookInstalled:
 			try:
-				NVDAHelper._setDllFuncPointer(NVDAHelper.localLib.dll, _FUNC_POINTER_NAME, self._original)
+				NVDAHelper._setDllFuncPointer(self._hookDll, self.hookSymbol, self._original)
 			except Exception:
 				log.error("Signal Filter: could not restore the live-region reporter", exc_info=True)
-			self._patched = False
+			self.hookInstalled = False
 		if self._typingPollTimer is not None:
 			try:
 				self._typingPollTimer.Stop()
@@ -440,23 +584,57 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		try:
 			if not self._shouldHandle():
 				return int(self._original(text, politeness))
-			s = _strip(text)
-			if not s:
-				return 0
-			if _NOISE_RE.match(s):
-				return 0
-			if len(s) <= _TYPING_TEXT_MAXLEN and _TYPING_TEXT_RE.match(s):
-				queueHandler.queueFunction(queueHandler.eventQueue, self._onTyping)
-				return 0
-			# Something changed that might be a message -> read it on the main
-			# thread.  Collapse a burst into a single queued scan.
-			if not self._scanQueued:
-				self._scanQueued = True
-				queueHandler.queueFunction(queueHandler.eventQueue, self._onMessageEvent)
+			self.helperEvents += 1
+			self._handleText(text, "helper")
 			return 0
 		except Exception:
 			log.error("Signal Filter: live-region handler error", exc_info=True)
 			return -1
+
+	# -- the same trigger, from a liveRegionChange event (main thread) ------
+
+	def handleObjectLiveRegion(self, obj):
+		"""Called by the Signal app module for a liveRegionChange event.
+
+		For Chromium read over IAccessible2 the live region never travels this
+		way -- the in-process helper callback above carries it -- so this path
+		normally sees nothing.  It matters when NVDA is reading Signal through UI
+		Automation instead, where the helper callback is never called and the
+		add-on would otherwise be completely silent.  Returns True when we have
+		taken ownership of the announcement, so the app module suppresses NVDA's
+		own reading of the region."""
+		if not self._shouldHandle():
+			return False
+		self.objectEvents += 1
+		if self.helperEvents and (time.time() - self._lastHelperEvent) < 60:
+			# The helper path is alive and has already carried this change, so this
+			# is a duplicate.  Leave NVDA's handling of it exactly as it was before
+			# this app module existed rather than changing a working setup; only
+			# count it, for the diagnostic report.
+			return False
+		self._handleText(_name(obj), "object")
+		return True
+
+	def _handleText(self, text, source):
+		"""Classify one live-region text and queue the (main-thread) work."""
+		s = _strip(text)
+		now = time.time()
+		self.lastEventTime = now
+		if source == "helper":
+			self._lastHelperEvent = now
+		self.recentTexts.append((now, source, s))
+		if not s:
+			return
+		if _NOISE_RE.match(s):
+			return
+		if len(s) <= _TYPING_TEXT_MAXLEN and _TYPING_TEXT_RE.match(s):
+			queueHandler.queueFunction(queueHandler.eventQueue, self._onTyping)
+			return
+		# Something changed that might be a message -> read it on the main
+		# thread.  Collapse a burst into a single queued scan.
+		if not self._scanQueued:
+			self._scanQueued = True
+			queueHandler.queueFunction(queueHandler.eventQueue, self._onMessageEvent)
 
 	def _shouldHandle(self):
 		try:
@@ -501,6 +679,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			up = _ancestorMatching(o, _isMessageList, maxUp=25)
 			if up is not None:
 				found = up
+				self.listPath = "walk up from focus"
 				break
 			# (b) The enclosing conversation container -- a small, relevant subtree
 			# to search down (the list sits near its top, so this is cheap even
@@ -513,6 +692,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			for cc in convRoots:
 				found = _findDescendant(cc, _isMessageList, maxDepth=20, maxNodes=2500)
 				if found is not None:
+					self.listPath = "conversation subtree"
 					break
 		if found is None and docRoots:
 			# Last resort: search the whole document.  This is expensive and, when
@@ -526,6 +706,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 						root, _isMessageList, maxDepth=30, maxNodes=LIST_DOC_SEARCH_MAXNODES
 					)
 					if found is not None:
+						self.listPath = "whole-document search"
 						break
 		if found is not None:
 			self._mlist = found
@@ -587,7 +768,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				if self._cfg("announceSent"):
 					self._debug("ANNOUNCE Message sent.")
 					# Translators: announced when the user's own message is sent.
-					ui.message(_("Message sent."))
+					self._say(_("Message sent."))
 				continue
 			# Incoming: the sender's typing has just ended by becoming this
 			# message, so end any typing state WITHOUT announcing "stopped".
@@ -596,12 +777,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			if self._cfg("announceReceived"):
 				if m["author"]:
 					self._debug("ANNOUNCE %r: %r" % (m["author"], m["text"]))
-					ui.message("%s: %s" % (m["author"], m["text"]))
+					self._say("%s: %s" % (m["author"], m["text"]))
 				else:
 					self._debug("ANNOUNCE received %r" % m["text"])
 					# Translators: an incoming message with no separate sender name
 					# (1:1 chats); {text} is the message body.
-					ui.message(_("Message received: {text}").format(text=m["text"]))
+					self._say(_("Message received: {text}").format(text=m["text"]))
 
 	def _remember(self, uuid):
 		self._seen[uuid] = time.time()
@@ -759,11 +940,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				if plural:
 					# Translators: announced when several people are typing; {who}
 					# is a list of names.
-					ui.message(_("{who} are typing.").format(who=subject))
+					self._say(_("{who} are typing.").format(who=subject))
 				else:
 					# Translators: announced when the other person starts typing;
 					# {who} is the contact name.
-					ui.message(_("{who} is typing.").format(who=subject))
+					self._say(_("{who} is typing.").format(who=subject))
 		# A fresh typing event means they're still at it -- reset the miss count.
 		self._typingMisses = 0
 		# Removals don't fire live-region events, so poll the DOM for the typing
@@ -846,7 +1027,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			self._debug("ANNOUNCE stopped typing")
 			# Translators: announced when the other person stops typing without
 			# sending a message; {who} is the contact name (or list of names).
-			ui.message(_("{who} stopped typing.").format(who=who))
+			self._say(_("{who} stopped typing.").format(who=who))
 		self._typingSubject = None
 
 	def _contact(self):
@@ -858,7 +1039,75 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			self._contactCache[conv] = name
 		return name
 
+	# -- diagnostics -------------------------------------------------------
+
+	def isSignalForeground(self):
+		return _isSignalForeground()
+
+	def hookStillOurs(self):
+		"""Is our callback still the installed one?
+
+		Another add-on that patches the same NVDA callback, or a plugin reload,
+		can quietly replace it -- which looks exactly like the add-on being
+		broken."""
+		if not self.hookInstalled:
+			return False
+		try:
+			installed = cast(
+				getattr(self._hookDll, self.hookSymbol), POINTER(c_void_p)
+			).contents.value
+			return installed == cast(self._hook, c_void_p).value
+		except Exception:
+			return None
+
+	def messageListForDiagnostics(self):
+		"""The message list, acquired the normal way -- for the report only."""
+		return self._messageList()
+
+	def reportDiagnostics(self):
+		"""Speak why the add-on is or is not announcing, and copy the details."""
+		try:
+			report = diagnostics.buildReport(self, _MarkerProbe)
+		except Exception:
+			log.error("Signal Filter: could not build a diagnostic report", exc_info=True)
+			# Translators: spoken when the diagnostic report could not be built.
+			ui.message(_("Signal Filter could not build a report. See the NVDA log."))
+			return
+		log.info("Signal Filter diagnostics:\n%s" % report)
+		spoken = diagnostics.spokenSummary(self)
+		copied = False
+		try:
+			api.copyToClip(report)
+			copied = True
+		except Exception:
+			log.error("Signal Filter: could not copy the report to the clipboard", exc_info=True)
+		if copied:
+			# Translators: spoken after the diagnostic report has been copied.
+			spoken = "%s %s" % (spoken, _("Full report copied to the clipboard."))
+		else:
+			# Translators: spoken when the report could only be written to the log.
+			spoken = "%s %s" % (spoken, _("Full report written to the NVDA log."))
+		ui.message(spoken)
+
+	@script(
+		# Translators: description of the diagnostics command in Input Gestures.
+		description=_(
+			"Reports why Signal Filter is or is not announcing, and copies the details "
+			"to the clipboard"
+		),
+		# Translators: the Input Gestures category for this add-on's commands.
+		category=_("Signal Filter"),
+		gesture="kb:NVDA+control+shift+s",
+	)
+	def script_signalFilterDiagnostics(self, gesture):
+		self.reportDiagnostics()
+
 	# -- misc --------------------------------------------------------------
+
+	def _say(self, text, **kwargs):
+		self.announceCount += 1
+		self.lastAnnounce = (time.time(), text)
+		ui.message(text, **kwargs)
 
 	def _cfg(self, key):
 		try:

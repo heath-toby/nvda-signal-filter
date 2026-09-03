@@ -59,9 +59,38 @@ Group support is included but **very experimental and lightly tested**:
 
 ## Settings
 
-Open NVDA menu → Preferences → Settings → **Signal Filter** to toggle: announcing
-on/off, ignoring timestamps and playback timers, ignoring repeated announcements,
-the duplicate window (seconds), and a debug log (written to the NVDA log).
+Open NVDA menu → Preferences → Settings → **Signal Filter** to toggle the add-on
+itself, each announcement (incoming messages, "Message sent.", "is typing.",
+"stopped typing."), and a debug log written to the NVDA log. The same panel has a
+**Report why Signal Filter is silent** button (see Troubleshooting).
+
+## Troubleshooting
+
+If the add-on is installed and enabled but says nothing, press
+**NVDA+control+shift+S** with a Signal conversation focused. It speaks a verdict
+naming the broken link in the chain and copies a full report to the clipboard
+(the same report also goes to the NVDA log). The same report is available from
+the **Report why Signal Filter is silent** button in the add-on's settings.
+
+The usual causes, all of which the report identifies:
+
+- **The hook could not be installed at all** (add-on 1.0.0 on NVDA 2025.3 or
+  earlier: NVDA 2026.1 moved the helper library the add-on hooks). Version 1.0.1
+  handles both layouts; if the report still says the hook is not installed,
+  send it along with the NVDA version.
+- **NVDA is reading Signal through UI Automation rather than IAccessible2.** The
+  live-region callback this add-on hooks is then never called. Set NVDA →
+  Preferences → Settings → Advanced → "Use UIA with Microsoft Edge and other
+  Chromium based browsers" to *Only when necessary*, then restart Signal. (The
+  add-on also handles the UIA path, but Signal exposes far less information that
+  way, so IAccessible2 is much better.)
+- **The application is not recognised as Signal.** Only executables named
+  Signal, Signal Beta, Signal Desktop, Signal Dev, Signal Nightly and Signal
+  Staging are matched; anything else is left completely alone.
+- **Another add-on has replaced the same NVDA callback.** Restarting NVDA
+  restores it.
+- **A Signal release renamed its CSS classes.** Then live regions arrive but no
+  announcement can be built; the report shows the classes it actually saw.
 
 ## How it works
 

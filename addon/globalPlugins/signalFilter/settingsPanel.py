@@ -53,6 +53,20 @@ class SignalFilterSettingsPanel(SettingsPanel):
 		)
 		self._debug.SetValue(conf["debug"])
 
+		# Translators: a button in Signal Filter settings.
+		self._diagnostics = sHelper.addItem(
+			wx.Button(self, label=_("&Report why Signal Filter is silent"))
+		)
+		self._diagnostics.Bind(wx.EVT_BUTTON, self._onDiagnostics)
+
+	def _onDiagnostics(self, evt):
+		from . import getActivePlugin
+
+		plugin = getActivePlugin()
+		if plugin is None:
+			return
+		plugin.reportDiagnostics()
+
 	def onSave(self):
 		conf = config.conf[CONFIG_SECTION]
 		conf["enabled"] = self._enabled.GetValue()
