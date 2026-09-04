@@ -40,7 +40,7 @@ jobs:
     - name: building addon
       run: scons && scons pot
 
-    - uses: actions/upload-artifact@v5
+    - uses: actions/upload-artifact@v7
       with:
         name: packaged_addon
         path: |
@@ -56,7 +56,13 @@ jobs:
     steps:
     - uses: actions/checkout@v5
     - name: download releases files
-      uses: actions/download-artifact@v6
+      uses: actions/download-artifact@v8
+      with:
+        # Name the artifact explicitly so it extracts to the workspace root.
+        # Without a name, download-artifact happens to flatten a lone artifact to
+        # the root, and the release steps below glob *.nvda-addon there -- naming
+        # it makes that layout guaranteed rather than incidental.
+        name: packaged_addon
     - name: Display structure of downloaded files
       run: ls -R
     - name: Calculate sha256
