@@ -24,7 +24,11 @@ calls ``NVDAHelper.nvdaControllerInternal_reportLiveRegion(text, politeness)``.
 We overwrite that callback's DLL function pointer (exactly as NVDA installs it),
 in whichever way this NVDA version exposes the helper library -- see
 ``_localHelperDlls``; guessing wrong there is silent, and silence is exactly what
-this add-on must never fail into.
+this add-on must never fail into.  We also point NVDA's own
+``nvdaControllerInternal_reportLiveRegion`` attribute at our callback, because
+that attribute -- not the DLL pointer -- is what another add-on hooking the same
+callback later reads to find the handler it must chain through (BrowserNav does
+exactly this).  Setting only the pointer leaves us silently cut out of the chain.
 While Signal is the foreground app our callback:
 
   * returns 0 for everything, so NVDA never speaks Signal's noisy live regions
@@ -514,10 +518,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		self.announceCount = 0
 		self.lastAnnounce = None
 		self.listPath = None
+		self.lastScan = None  # what the last message scan actually saw
 		self.addonVersion = _addonVersion()
 
 		self._hookDll = None
 		self.hookLayout = None
+		self._terminated = False
 		self._original = getattr(NVDAHelper, "nvdaControllerInternal_reportLiveRegion", None)
 		self._hook = None
 		dlls = _localHelperDlls()
@@ -542,6 +548,16 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				if self.hookInstalled:
 					break
 			if self.hookInstalled:
+				# Publish ourselves as NVDA's live-region reporter as well as
+				# writing the DLL pointer.  Both matter, for different reasons:
+				# the DLL pointer is what the in-process helper actually calls,
+				# but an add-on that hooks the same callback later (BrowserNav
+				# does) reads THIS attribute to find "the original" to chain
+				# through.  Setting only the pointer means such an add-on saves
+				# NVDA's own reporter, overwrites the pointer with its own hook,
+				# and we are silently cut out of the chain entirely -- the
+				# add-on then looks healthy but never announces anything.
+				NVDAHelper.nvdaControllerInternal_reportLiveRegion = self._hook
 				log.info(
 					"Signal Filter %s: live-region reporter hooked (%s.%s)"
 					% (self.addonVersion, self.hookLayout, self.hookSymbol)
@@ -558,9 +574,18 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		global _activePlugin
 		if _activePlugin is self:
 			_activePlugin = None
+		self._terminated = True
 		if self.hookInstalled:
 			try:
-				NVDAHelper._setDllFuncPointer(self._hookDll, self.hookSymbol, self._original)
+				if getattr(NVDAHelper, "nvdaControllerInternal_reportLiveRegion", None) is self._hook:
+					NVDAHelper.nvdaControllerInternal_reportLiveRegion = self._original
+				# Only take the DLL pointer back if it is still ours.  If another
+				# add-on hooked on top of us, it holds our callback as its
+				# "original" and restoring here would rip its chain out from
+				# under it.  We stay in the chain as a pass-through instead --
+				# see the _terminated check in _reportLiveRegion.
+				if self.hookStillOurs():
+					NVDAHelper._setDllFuncPointer(self._hookDll, self.hookSymbol, self._original)
 			except Exception:
 				log.error("Signal Filter: could not restore the live-region reporter", exc_info=True)
 			self.hookInstalled = False
@@ -582,13 +607,32 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		"""Cheap and must never raise into the C caller.  Does NO accessibility
 		work here -- it only classifies the text and queues main-thread work."""
 		try:
-			if not self._shouldHandle():
-				return int(self._original(text, politeness))
+			if self._terminated or not self._shouldHandle():
+				return self._callOriginal(text, politeness)
 			self.helperEvents += 1
 			self._handleText(text, "helper")
 			return 0
 		except Exception:
 			log.error("Signal Filter: live-region handler error", exc_info=True)
+			return -1
+
+	def _callOriginal(self, text, politeness):
+		"""Hand the call on to whatever we replaced.
+
+		Usually NVDA's own reporter (a ctypes callback), but when another add-on
+		hooked this callback before us it is that add-on's handler, which is just
+		a Python function and need not return an int at all.  A neighbour's sloppy
+		return value must not turn into an exception per live region, so coerce
+		what we can and treat anything else as -1 ("not reported"), which is what
+		NVDA itself returns when it declines one."""
+		try:
+			result = self._original(text, politeness)
+		except Exception:
+			log.error("Signal Filter: the chained live-region handler raised", exc_info=True)
+			return -1
+		try:
+			return int(result)
+		except (TypeError, ValueError):
 			return -1
 
 	# -- the same trigger, from a liveRegionChange event (main thread) ------
@@ -737,30 +781,60 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			firstSeen = self._convFirstSeen[conv] = now
 		priming = (now - firstSeen) < PRIME_GRACE_SECONDS
 
+		scan = {
+			"time": now,
+			"conv": conv or "<none>",
+			"children": n,
+			"path": self.listPath,
+			"priming": priming,
+			"seen": len(self._seen),
+			"examined": [],
+		}
+		self.lastScan = scan
+
 		newMsgs = []
 		for i in range(n - 1, max(-1, n - 1 - SCAN_TAIL), -1):
 			child = _getChild(mlist, i)
 			if child is None:
+				scan["examined"].append((i, "no such child"))
 				continue
 			container = _messageContainer(child)
 			if container is None:
+				# No id="message-accessibility-contents:..." anywhere under this
+				# child.  Record the child's own class: if this happens for every
+				# child, either Signal renamed that id or the list we found is not
+				# the real message list.
+				scan["examined"].append((i, "no message container; child class=%r" % _cls(child)[:80]))
 				continue
 			uuid = _id(container)
 			if uuid in self._seen:
+				scan["examined"].append((i, "already seen"))
 				break
 			info = _messageInfo(container)
 			if info:
+				scan["examined"].append((i, "NEW %r" % ((info.get("text") or "")[:40],)))
 				newMsgs.append(info)
+			else:
+				scan["examined"].append((i, "unreadable (id=%r)" % uuid[:60]))
 		newMsgs.reverse()
 
 		if not newMsgs:
+			scan["outcome"] = "nothing new in the last %d children" % SCAN_TAIL
 			return
 
 		if priming or len(newMsgs) > ANNOUNCE_MAX:
 			for m in newMsgs:
 				self._remember(m["uuid"])
-			self._debug("absorbed %d message(s) silently" % len(newMsgs))
+			why = (
+				"first scan of this conversation (priming)"
+				if priming
+				else "%d at once looks like history, not new traffic" % len(newMsgs)
+			)
+			scan["outcome"] = "absorbed %d silently: %s" % (len(newMsgs), why)
+			self._debug("absorbed %d message(s) silently: %s" % (len(newMsgs), why))
 			return
+
+		scan["outcome"] = "announced %d" % len(newMsgs)
 
 		for m in newMsgs:
 			self._remember(m["uuid"])

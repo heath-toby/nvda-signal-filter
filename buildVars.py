@@ -31,14 +31,15 @@ indicator through untouched. No other application is affected. It works by
 filtering NVDA's web live-region callback, so there is no lag."""
 	),
 	# version
-	addon_version="1.0.1",
+	addon_version="1.0.3",
 	# Brief changelog for this version
 	# Translators: what's new content for the add-on version to be shown in the add-on store
 	addon_changelog=_(
-		"""Works on more setups: the live-region hook now falls back to the
-undecorated symbol name, Signal Beta and Signal Desktop are recognised, and live
-regions delivered through UI Automation are handled too. Adds a diagnostics
-command (NVDA+control+shift+S) that says why the add-on is silent."""
+		"""Fixes the add-on being silent when BrowserNav, or any other add-on
+that hooks NVDA's live-region callback, is also installed: the two now chain
+through each other in either load order. The diagnostic report names such
+add-ons, and gains a "last message scan" section that says which step stopped an
+announcement."""
 	),
 	# Author(s)
 	addon_author="Tobias <require_flatfoot171@simplelogin.com>",

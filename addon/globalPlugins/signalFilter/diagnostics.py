@@ -136,7 +136,8 @@ def buildReport(plugin, markers):
 	add("-- live-region hook --")
 	add("  hooked: %s" % plugin.hookInstalled)
 	add("  symbol: %s.%s" % (plugin.hookLayout or "<none>", plugin.hookSymbol or "<none>"))
-	add("  still installed (not replaced by anything else): %s" % _safe(plugin.hookStillOurs))
+	add("  still the outermost hook: %s" % _safe(plugin.hookStillOurs))
+	add("  other add-ons hooking the same callback: %s" % _safe(_coHookingAddons, default="<unknown>"))
 	if plugin.hookError:
 		add("  error: %s" % plugin.hookError)
 	add("  callbacks received (helper / IAccessible2 path): %d" % plugin.helperEvents)
@@ -194,6 +195,27 @@ def buildReport(plugin, markers):
 	add("  acquisition path last used: %s" % (plugin.listPath or "<none>"))
 
 	add("")
+	add("-- last message scan --")
+	scan = getattr(plugin, "lastScan", None)
+	if not scan:
+		add("  <the message list has never been scanned>")
+		add("  A scan is queued only by a live-region event that is not obvious noise.")
+	else:
+		add("  ran: %.1fs ago" % (now - scan.get("time", now)))
+		add("  conversation id: %s" % scan.get("conv"))
+		add("  list acquired by: %s" % scan.get("path"))
+		add("  children: %s" % scan.get("children"))
+		add("  first scan of this conversation (absorbs silently): %s" % scan.get("priming"))
+		add("  messages remembered this session: %s" % scan.get("seen"))
+		add("  newest children examined (newest first):")
+		if scan.get("examined"):
+			for index, note in scan["examined"]:
+				add("    [%s] %s" % (index, note))
+		else:
+			add("    <none -- the list reported no children>")
+		add("  outcome: %s" % scan.get("outcome", "<scan did not finish>"))
+
+	add("")
 	add("-- verdict --")
 	lines.extend(_verdict(plugin))
 	return "\n".join(str(line) for line in lines)
@@ -202,6 +224,28 @@ def buildReport(plugin, markers):
 def spokenSummary(plugin):
 	"""The verdict as one speakable sentence."""
 	return " ".join(line.strip() for line in _verdict(plugin))
+
+
+# Add-ons known to overwrite the same NVDA live-region callback.  Sharing it is
+# fine as long as each one chains to whatever it replaced -- this list exists so
+# a report names the neighbour instead of leaving "something else" to guess at.
+_CO_HOOKING_ADDONS = {
+	"browsernav": "BrowserNav",
+}
+
+
+def _coHookingAddons():
+	try:
+		import addonHandler
+
+		found = []
+		for addon in addonHandler.getRunningAddons():
+			label = _CO_HOOKING_ADDONS.get((addon.name or "").lower())
+			if label:
+				found.append("%s %s" % (label, addon.version))
+		return ", ".join(found) if found else "<none known>"
+	except Exception:
+		return "<unknown>"
 
 
 def _verdict(plugin):
@@ -214,10 +258,11 @@ def _verdict(plugin):
 	if _safe(lambda: config.conf[CONFIG_SECTION]["enabled"], default=False) is not True:
 		out.append("  The add-on is switched off in its own settings.")
 		return out
-	if _safe(plugin.hookStillOurs, default=None) is False:
-		out.append("  Something else has replaced the live-region callback since the")
-		out.append("  add-on installed it -- another add-on that patches the same NVDA")
-		out.append("  callback, or a plugin reload.  Restarting NVDA restores it.")
+	if _safe(plugin.hookStillOurs, default=None) is False and plugin.helperEvents == 0:
+		out.append("  Another add-on hooked the live-region callback after this one and")
+		out.append("  is not passing calls on, so this add-on is never reached.  See")
+		out.append("  'other add-ons hooking the same callback' above; disable that")
+		out.append("  add-on to confirm.")
 		return out
 	if plugin.helperEvents == 0 and plugin.objectEvents == 0:
 		out.append("  The hook is installed but has never been called while Signal was")
@@ -234,12 +279,29 @@ def _verdict(plugin):
 		out.append("  necessary', then restart Signal.")
 		return out
 	if plugin.announceCount == 0:
-		out.append("  Live regions are arriving, but Signal's markers could not be read,")
-		out.append("  so no announcement could be built.  Look at the marker probe above:")
-		out.append("  if ia2class is empty everywhere, NVDA is not using IAccessible2 for")
-		out.append("  Signal; if it is populated but never contains")
-		out.append("  'module-timeline__messages', this Signal release renamed its CSS")
-		out.append("  classes and the add-on needs updating.")
+		scan = getattr(plugin, "lastScan", None)
+		if not scan:
+			out.append("  Live regions are arriving, but the message list was never")
+			out.append("  scanned -- every event so far was classified as noise or as a")
+			out.append("  typing indicator.  See 'recent live-region texts' above.")
+			return out
+		if scan.get("priming"):
+			out.append("  Live regions are arriving and the messages were read, but this")
+			out.append("  was the first scan of the conversation, so they were absorbed as")
+			out.append("  the starting point rather than announced.  Send another message:")
+			out.append("  that one should be announced.")
+			return out
+		notes = [note for _index, note in scan.get("examined") or []]
+		if notes and all(n.startswith("no message container") for n in notes):
+			out.append("  The message list was found, but none of its newest children")
+			out.append("  contain an id starting 'message-accessibility-contents:'.  Either")
+			out.append("  this Signal release renamed that id, or the element found is not")
+			out.append("  the real message list.  See 'newest children examined' above --")
+			out.append("  the child classes there say which.")
+			return out
+		out.append("  Live regions are arriving and the message list was found, but no")
+		out.append("  announcement was built.  The 'last message scan' section above says")
+		out.append("  exactly which step stopped it.")
 		return out
 	out.append("  Events arrive and announcements have been made: the add-on is working.")
 	return out

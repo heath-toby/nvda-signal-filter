@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.0.3
+
+- **Fixed: the add-on was silent when BrowserNav (or any other add-on that hooks
+  NVDA's live-region callback) was also installed.** Such an add-on reads
+  `NVDAHelper.nvdaControllerInternal_reportLiveRegion` to find the handler it
+  should chain through. Signal Filter only overwrote the DLL function pointer
+  and left that attribute alone, so an add-on loading after it saved NVDA's own
+  reporter as "the original" and overwrote the pointer -- cutting Signal Filter
+  out of the chain completely. It now publishes its callback under that
+  attribute too, so the two chain in either load order.
+- Unhooking no longer rips out an add-on that hooked on top of this one: the DLL
+  pointer is only taken back when it is still ours, and the callback becomes a
+  pass-through once the plugin has terminated.
+- Chaining on to a handler that is another add-on's plain Python function, rather
+  than a ctypes callback, no longer logs an exception per live region.
+- The diagnostic report (NVDA+control+shift+S) now names the other add-ons that
+  hook the same callback, and no longer reports being hooked over as a fault when
+  calls are still arriving. Note that with BrowserNav installed, "still the
+  outermost hook: False" is the healthy state, not a fault.
+- The report also gains a "last message scan" section: the conversation id, how
+  the message list was acquired, whether the scan was the conversation's first
+  (which absorbs silently by design), and a per-child account of what the newest
+  children looked like. This distinguishes normal priming from a renamed Signal
+  marker or the wrong element being found as the list.
+- Fixed a misleading verdict: "Signal's markers could not be read" was reported
+  even when the message list had been found and read perfectly well.
+
 ## 1.0.1
 
 - **Fixed: the add-on did nothing at all on NVDA 2025.3 and earlier.** NVDA
